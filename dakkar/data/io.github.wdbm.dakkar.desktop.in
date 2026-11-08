@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Dakkar
+Comment=Browse and search filenames
+Exec=@EXECUTABLE@ %U
+Icon=io.github.wdbm.dakkar
+Terminal=false
+Categories=System;FileTools;FileManager;GTK;GNOME;
+MimeType=inode/directory;
+StartupNotify=true
