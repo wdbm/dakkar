@@ -11,6 +11,17 @@ import threading
 
 from gi.repository import Gio, GLib
 
+from .duplicates import (
+    DuplicateCopy,
+    DuplicateTrashResult,
+    FileChangedError,
+    ScanCancelled,
+    TrashOutcome,
+    identical,
+    is_trash_path,
+)
+from .empty_files import RestoreOutcome, RestoreRequest, RestoreResult, restore_empty_file
+from .operation_progress import OperationMonitor, OperationReporter
 from .services import _idle_call
 
 
@@ -64,6 +75,13 @@ class _OperationCancelled(Exception):
     pass
 
 
+class _PartialOperationError(Exception):
+    def __init__(self, error: Exception, changed: list[Gio.File]) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.changed = changed
+
+
 @dataclass(frozen=True, slots=True)
 class ClipboardState:
     uris: tuple[str, ...] = ()
@@ -83,41 +101,54 @@ class OperationService:
     """
 
     def __init__(self) -> None:
+        self.monitor = OperationMonitor()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dakkar-operation")
-        self._cancellable: Gio.Cancellable | None = None
+        self._cancellables: list[Gio.Cancellable] = []
         self._lock = threading.Lock()
 
     def cancel(self) -> None:
         with self._lock:
-            if self._cancellable is not None:
-                self._cancellable.cancel()
+            for cancellable in self._cancellables:
+                cancellable.cancel()
 
     def _submit(
         self,
-        operation: Callable[[Gio.Cancellable, ProgressCallback], list[Gio.File]],
+        operation: Callable[[Gio.Cancellable, OperationReporter], list[Gio.File]],
         callback: OperationCallback,
         progress: ProgressCallback | None = None,
-    ) -> None:
+        title: str = "File operation",
+        destination: Gio.File | None = None,
+    ) -> Gio.Cancellable:
         cancellable = Gio.Cancellable()
         with self._lock:
-            self._cancellable = cancellable
+            self._cancellables.append(cancellable)
+        report = OperationReporter(self.monitor, cancellable, title, progress, destination)
+        self.monitor.add(cancellable, report.summary_title)
 
-        def report(label: str, completed: int, total: int) -> None:
-            if progress is not None:
-                GLib.idle_add(_idle_call, progress, label, completed, total)
+        def completed(error, changed, cancelled):
+            self.monitor.finish(
+                cancellable, error, cancelled, report.summary, report.failed,
+            )
+            callback(error, changed)
 
         def run() -> None:
             error: Exception | None = None
             changed: list[Gio.File] = []
             try:
                 changed = operation(cancellable, report)
+            except _PartialOperationError as caught:
+                error, changed = caught.error, caught.changed
             except Exception as caught:
                 # The worker boundary must return unexpected operation failures
                 # to the GTK thread rather than terminating silently.
                 error = caught
-            GLib.idle_add(_idle_call, callback, error, changed)
+            finally:
+                with self._lock:
+                    self._cancellables.remove(cancellable)
+            GLib.idle_add(_idle_call, completed, error, changed, cancellable.is_cancelled())
 
         self._executor.submit(run)
+        return cancellable
 
     def create_directory(
         self,
@@ -135,7 +166,7 @@ class OperationService:
             child.make_directory(cancellable)
             return [child]
 
-        self._submit(operation, callback)
+        self._submit(operation, callback, title=f"Create directory: {clean_name}")
 
     def create_file(
         self,
@@ -154,7 +185,7 @@ class OperationService:
             stream.close(cancellable)
             return [child]
 
-        self._submit(operation, callback)
+        self._submit(operation, callback, title=f"Create file: {clean_name}")
 
     def rename(
         self,
@@ -171,7 +202,7 @@ class OperationService:
             renamed = file.set_display_name(clean_name, cancellable)
             return [renamed]
 
-        self._submit(operation, callback)
+        self._submit(operation, callback, title=f"Rename to {clean_name}")
 
     def delete_empty_directory(
         self,
@@ -186,7 +217,7 @@ class OperationService:
             directory.delete(cancellable)
             return [directory]
 
-        self._submit(operation, callback)
+        self._submit(operation, callback, title="Delete empty directory")
 
     def delete_empty_file(
         self,
@@ -211,7 +242,7 @@ class OperationService:
             file.delete(cancellable)
             return [file]
 
-        self._submit(operation, callback)
+        self._submit(operation, callback, title="Delete empty file")
 
     def trash(
         self,
@@ -223,13 +254,143 @@ class OperationService:
 
         def operation(cancellable, report):
             changed: list[Gio.File] = []
-            for index, file in enumerate(file_list, 1):
-                file.trash(cancellable)
-                changed.append(file)
-                report(file.get_basename() or file.get_uri(), index, len(file_list))
+            try:
+                for index, file in enumerate(file_list, 1):
+                    file.trash(cancellable)
+                    changed.append(file)
+                    report(file.get_basename() or file.get_uri(), index, len(file_list))
+            except Exception as error:
+                raise _PartialOperationError(error, changed) from error
             return changed
 
-        self._submit(operation, callback, progress)
+        self._submit(operation, callback, progress, title="Move to Trash")
+
+    def trash_duplicates(
+        self,
+        copies: Iterable[DuplicateCopy],
+        callback: Callable[[DuplicateTrashResult], None],
+        progress: ProgressCallback | None = None,
+    ) -> Gio.Cancellable:
+        """
+        Revalidate reviewed copies and report every move, skip or failure separately.
+
+        The final path-based Trash call cannot be atomic with content comparison.
+        No permanent deletion is attempted when Trash is unavailable.
+        """
+
+        copy_list = tuple(copies)
+        candidate_paths = {copy.candidate.path for copy in copy_list}
+        keeper_paths = {copy.keeper.path for copy in copy_list}
+        if len(candidate_paths) != len(copy_list) or candidate_paths & keeper_paths:
+            raise ValueError("Each copy must be unique and retained files cannot be removed.")
+        outcomes: list[TrashOutcome] = []
+
+        def operation(cancellable, report):
+            changed = []
+            for index, copy in enumerate(copy_list, 1):
+                candidate = copy.candidate.path
+                if cancellable.is_cancelled():
+                    outcomes.append(TrashOutcome(copy, "skipped", "Operation cancelled."))
+                    continue
+                try:
+                    if (
+                        candidate.parent != copy.keeper.path.parent
+                        or is_trash_path(candidate)
+                        or is_trash_path(copy.keeper.path)
+                    ):
+                        raise FileChangedError("The reviewed copy is outside the permitted scope.")
+                    if not identical(copy.keeper, copy.candidate, cancellable.is_cancelled):
+                        raise FileChangedError("The copy no longer matches the retained file.")
+                    if cancellable.is_cancelled():
+                        raise ScanCancelled()
+                    file = Gio.File.new_for_path(str(candidate))
+                    file.trash(cancellable)
+                    changed.append(file)
+                    outcomes.append(TrashOutcome(copy, "moved"))
+                except ScanCancelled:
+                    outcomes.append(TrashOutcome(copy, "skipped", "Operation cancelled."))
+                except OSError as error:
+                    outcomes.append(TrashOutcome(copy, "skipped", str(error)))
+                except GLib.Error as error:
+                    status = "skipped" if cancellable.is_cancelled() else "failed"
+                    outcomes.append(TrashOutcome(copy, status, str(error)))
+                report(candidate.name, index, len(copy_list))
+            report.summary = "; ".join(
+                f"{label}: {sum(outcome.status == status for outcome in outcomes)}"
+                for label, status in (("Moved", "moved"), ("Skipped", "skipped"), ("Failed", "failed"))
+            )
+            report.failed = any(outcome.status == "failed" for outcome in outcomes)
+            return changed
+
+        def completed(error, _changed):
+            if error is not None:
+                for copy in copy_list[len(outcomes):]:
+                    outcomes.append(TrashOutcome(copy, "failed", str(error)))
+            callback(DuplicateTrashResult(tuple(outcomes), str(error) if error else ""))
+
+        return self._submit(operation, completed, progress, title="Move duplicate copies to Trash")
+
+    def restore_empty_files(
+        self,
+        requests: Iterable[RestoreRequest],
+        callback: Callable[[RestoreResult], None],
+        progress: ProgressCallback | None = None,
+    ) -> Gio.Cancellable:
+        """
+        Restore reviewed empty files and retain outcomes across failures or cancellation.
+        """
+
+        request_list = tuple(requests)
+        destinations = {request.destination.path for request in request_list}
+        sources = {request.source.path for request in request_list}
+        if len(destinations) != len(request_list) or destinations & sources:
+            raise ValueError("Destinations must be unique and cannot also be replacement sources.")
+        outcomes: list[RestoreOutcome] = []
+
+        def operation(cancellable, report):
+            changed = []
+            for index, request in enumerate(request_list, 1):
+                if cancellable.is_cancelled():
+                    outcomes.append(RestoreOutcome(request, "skipped", "Operation cancelled."))
+                    continue
+                destination = request.destination.path
+                transfer_progress = report.transfer(
+                    Gio.File.new_for_path(str(request.source.path)),
+                    Gio.File.new_for_path(str(destination)),
+                )
+
+                def copy_progress(completed_bytes: int, total_bytes: int) -> None:
+                    transfer_progress(completed_bytes, total_bytes)
+                    report(
+                        f"{destination.name}: {GLib.format_size(completed_bytes)} of "
+                        f"{GLib.format_size(total_bytes)}", index - 1, len(request_list),
+                    )
+
+                try:
+                    restore_empty_file(request, cancellable.is_cancelled, copy_progress)
+                    outcomes.append(RestoreOutcome(request, "restored"))
+                    changed.append(Gio.File.new_for_path(str(destination)))
+                except ScanCancelled:
+                    outcomes.append(RestoreOutcome(request, "skipped", "Operation cancelled."))
+                except FileChangedError as error:
+                    outcomes.append(RestoreOutcome(request, "skipped", str(error)))
+                except (OSError, ValueError) as error:
+                    outcomes.append(RestoreOutcome(request, "failed", str(error)))
+                report(destination.name, index, len(request_list))
+            report.summary = "; ".join(
+                f"{label}: {sum(outcome.status == status for outcome in outcomes)}"
+                for label, status in (("Restored", "restored"), ("Skipped", "skipped"), ("Failed", "failed"))
+            )
+            report.failed = any(outcome.status == "failed" for outcome in outcomes)
+            return changed
+
+        def completed(error, _changed):
+            if error is not None:
+                for request in request_list[len(outcomes):]:
+                    outcomes.append(RestoreOutcome(request, "failed", str(error)))
+            callback(RestoreResult(tuple(outcomes), str(error) if error else ""))
+
+        return self._submit(operation, completed, progress, title="Restore empty files")
 
     def delete(
         self,
@@ -247,7 +408,7 @@ class OperationService:
                 report(file.get_basename() or file.get_uri(), index, len(file_list))
             return changed
 
-        self._submit(operation, callback, progress)
+        self._submit(operation, callback, progress, title="Delete permanently")
 
     def copy_or_move(
         self,
@@ -304,6 +465,7 @@ class OperationService:
                             conflict,
                             cancellable,
                             session,
+                            report.transfer,
                         )
                     else:
                         result = self._copy_tree(
@@ -312,20 +474,27 @@ class OperationService:
                             conflict,
                             cancellable,
                             session,
+                            report.transfer,
                         )
                 except _OperationCancelled:
+                    cancellable.cancel()
                     if (
                         session is not None
                         and session.modification_count > modifications_before
                     ):
                         changed.append(target)
                     break
+                except Exception as error:
+                    if session is not None and session.modification_count > modifications_before:
+                        changed.append(target)
+                    raise _PartialOperationError(error, changed) from error
                 if result is not None:
                     changed.append(result)
                     report(basename, index, len(file_list))
             return changed
 
-        self._submit(operation, callback, progress)
+        action = "Move" if move else "Copy"
+        self._submit(operation, callback, progress, title=action, destination=destination)
 
     def duplicate(
         self,
@@ -343,12 +512,12 @@ class OperationService:
                 if parent is None or not basename:
                     continue
                 target = self._unique_target(parent.get_child(basename), cancellable)
-                self._copy_tree(source, target, "rename", cancellable)
+                self._copy_tree(source, target, "rename", cancellable, transfer=report.transfer)
                 changed.append(target)
                 report(basename, index, len(file_list))
             return changed
 
-        self._submit(operation, callback, progress)
+        self._submit(operation, callback, progress, title="Duplicate")
 
     @staticmethod
     def _exists(file: Gio.File, cancellable: Gio.Cancellable) -> bool:
@@ -553,6 +722,7 @@ class OperationService:
         conflict: str,
         cancellable: Gio.Cancellable,
         session: _ConflictSession | None = None,
+        transfer: Callable[[Gio.File, Gio.File], Callable] | None = None,
     ) -> Gio.File | None:
         source_info = self._query_item_info(source, cancellable)
         source_is_directory = self._is_directory(source_info)
@@ -580,6 +750,7 @@ class OperationService:
                     conflict,
                     cancellable,
                     session,
+                    transfer,
                 )
             if decision.action == "replace" and not (
                 source_is_directory and self._is_directory(target_info)
@@ -590,7 +761,7 @@ class OperationService:
                         Gio.FileCopyFlags.NOFOLLOW_SYMLINKS
                         | Gio.FileCopyFlags.OVERWRITE,
                         cancellable,
-                        None,
+                        transfer(source, target) if transfer is not None else None,
                         None,
                     )
                     self._mark_modified(session)
@@ -604,7 +775,7 @@ class OperationService:
                 target,
                 Gio.FileCopyFlags.NOFOLLOW_SYMLINKS,
                 cancellable,
-                None,
+                transfer(source, target) if transfer is not None else None,
                 None,
             )
             self._mark_modified(session)
@@ -634,6 +805,7 @@ class OperationService:
                     conflict,
                     cancellable,
                     session,
+                    transfer,
                 )
         finally:
             enumerator.close(cancellable)
@@ -646,6 +818,7 @@ class OperationService:
         conflict: str,
         cancellable: Gio.Cancellable,
         session: _ConflictSession | None = None,
+        transfer: Callable[[Gio.File, Gio.File], Callable] | None = None,
     ) -> Gio.File | None:
         source_info = self._query_item_info(source, cancellable)
         source_is_directory = self._is_directory(source_info)
@@ -673,6 +846,7 @@ class OperationService:
                     conflict,
                     cancellable,
                     session,
+                    transfer,
                 )
             if decision.action == "merge":
                 children: list[tuple[Gio.File, str]] = []
@@ -699,6 +873,7 @@ class OperationService:
                         conflict,
                         cancellable,
                         session,
+                        transfer,
                     )
                     modified = result is not None or modified
                 try:
@@ -721,16 +896,22 @@ class OperationService:
         if target_info is not None:
             flags |= Gio.FileCopyFlags.OVERWRITE
         try:
-            source.move(target, flags, cancellable, None, None)
+            source.move(
+                target, flags, cancellable,
+                transfer(source, target) if transfer is not None else None, None,
+            )
             self._mark_modified(session)
             return target
         except GLib.Error:
+            if cancellable.is_cancelled():
+                raise
             copied = self._copy_tree(
                 source,
                 target,
                 "replace" if target_info is not None else conflict,
                 cancellable,
                 session,
+                transfer,
             )
             if copied is not None:
                 self._delete_tree(source, cancellable)

@@ -36,6 +36,8 @@ def application_css(system_theme: bool) -> bytes:
         {palette}
         .dakkar-pathbar {{ padding: 4px 8px; }}
         .dakkar-status {{ padding: 5px 10px; }}
+        .dakkar-operation-progress, .dakkar-operation-progress text {{ color: inherit; }}
+        .dakkar-operation-progress text {{ font-size: 1em; }}
         .dakkar-grid-cell {{ padding: 8px; border-radius: 8px; }}
         .dakkar-grid-label {{ font-size: 0.92em; }}
         .dakkar-high-contrast button {{
@@ -125,6 +127,7 @@ class DakkarApplication(Gtk.Application):
             "win.keyboard-shortcuts": ["F1"],
             "win.show-hidden": ["<Primary>h"],
             "win.toggle-places": ["F9"],
+            "win.toggle-operations": ["<Primary><Shift>o"],
             "win.list-view": ["<Primary>1"],
             "win.grid-view": ["<Primary>2"],
             "win.expandable-list-view": ["<Primary>3"],

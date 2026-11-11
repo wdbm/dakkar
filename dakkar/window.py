@@ -41,6 +41,10 @@ from .directory_tint import (
     DirectoryTintSettings,
     TintChannelSettings,
 )
+from .duplicate_dialog import DuplicateDialog
+from .duplicates import DuplicateTrashResult, is_trash_path
+from .empty_file_dialog import EmptyFileDialog
+from .empty_files import RestoreResult
 from .launching import common_applications, group_items_by_default_application
 from .metadata import read_media_metadata
 from .models import FileItem
@@ -87,6 +91,7 @@ KEYBOARD_SHORTCUTS = (
     ("Shift+Delete", "Delete selected items permanently"),
     ("F5 or Ctrl+R", "Refresh the displayed location"),
     ("F9", "Show or hide Places"),
+    ("Ctrl+Shift+O", "Show or hide file operations"),
 )
 
 
@@ -131,6 +136,9 @@ class DakkarWindow(Gtk.ApplicationWindow):
         self.thumbnails = ThumbnailService()
         self.saved_searches = SavedSearchStore()
         self.undo_manager = UndoManager()
+        self._duplicate_dialogs: set[DuplicateDialog] = set()
+        self._empty_file_dialogs: set[EmptyFileDialog] = set()
+        self._closing = False
         self._sidebar_rows: list[Gtk.ListBoxRow] = []
         self._path_buttons: list[Gtk.Widget] = []
         self._closed_tabs: list[ClosedTabState] = []
@@ -312,7 +320,10 @@ class DakkarWindow(Gtk.ApplicationWindow):
         file_section.append("Open in terminal", "win.terminal")
         file_section.append("Create archive…", "win.create-archive")
         file_section.append("Extract here", "win.extract-here")
+        file_section.append("Find duplicate copies…", "win.find-duplicates")
+        file_section.append("Restore empty files…", "win.restore-empty-files")
         file_section.append("Cancel file operation", "win.cancel-operation")
+        file_section.append("Show or hide file operations", "win.toggle-operations")
         file_section.append("Empty Trash…", "win.empty-trash")
         file_section.append("Properties…", "win.properties")
         menu.append_section(None, file_section)
@@ -1598,6 +1609,8 @@ class DakkarWindow(Gtk.ApplicationWindow):
             "copy-to": lambda *_: self._copy_or_move_to(False),
             "move-to": lambda *_: self._copy_or_move_to(True),
             "duplicate": lambda *_: self._duplicate(),
+            "find-duplicates": lambda *_: self._find_duplicates(),
+            "restore-empty-files": lambda *_: self._restore_empty_files(),
             "create-archive": lambda *_: self._create_archive(),
             "extract-here": lambda *_: self._extract_archive(False),
             "extract-to": lambda *_: self._extract_archive(True),
@@ -1618,6 +1631,7 @@ class DakkarWindow(Gtk.ApplicationWindow):
             "zoom-out": lambda *_: self._zoom(-16),
             "empty-trash": lambda *_: self._empty_trash(),
             "cancel-operation": lambda *_: self.operations.cancel(),
+            "toggle-operations": lambda *_: self._with_tab("toggle_operation_panel"),
         }
         for name, callback in callbacks.items():
             action = Gio.SimpleAction.new(name, None)
@@ -1629,6 +1643,8 @@ class DakkarWindow(Gtk.ApplicationWindow):
             "open-window-at": self.open_location_in_window,
             "open-terminal-at": self._open_terminal_at,
             "paste-to": self._paste_to,
+            "find-duplicates-at": self._find_duplicates_at,
+            "restore-empty-files-at": self._restore_empty_files_at,
         }
         string_type = GLib.VariantType.new("s")
         for name, callback in targeted_callbacks.items():
@@ -1670,6 +1686,8 @@ class DakkarWindow(Gtk.ApplicationWindow):
             "copy-to": bool(selected),
             "move-to": bool(selected),
             "duplicate": bool(selected),
+            "find-duplicates": tab is not None and self.can_find_duplicates(tab.location),
+            "restore-empty-files": tab is not None and self.can_restore_empty_files(tab.location),
             "create-archive": all_local,
             "extract-here": all_files and all_local,
             "extract-to": all_files and all_local,
@@ -1922,7 +1940,7 @@ class DakkarWindow(Gtk.ApplicationWindow):
 
     def _non_undoable_done(self, label: str):
         def completed(error: Exception | None, changed: list[Gio.File]) -> None:
-            if error is None and changed:
+            if changed:
                 self.undo_manager.block(label)
             self._operation_done(error, changed)
 
@@ -1954,7 +1972,6 @@ class DakkarWindow(Gtk.ApplicationWindow):
             destination,
             state.cut,
             self._non_undoable_done("Move" if state.cut else "Copy"),
-            self._operation_progress,
             conflict="ask",
             conflict_prompt=self._present_transfer_conflict,
         )
@@ -1981,7 +1998,6 @@ class DakkarWindow(Gtk.ApplicationWindow):
             self._non_undoable_done(
                 "Drag-and-drop move" if move else "Drag-and-drop copy"
             ),
-            self._operation_progress,
             conflict="ask",
             conflict_prompt=self._present_transfer_conflict,
         )
@@ -2012,7 +2028,6 @@ class DakkarWindow(Gtk.ApplicationWindow):
                     destination,
                     move,
                     self._non_undoable_done("Move" if move else "Copy"),
-                    self._operation_progress,
                     conflict="ask",
                     conflict_prompt=self._present_transfer_conflict,
                 )
@@ -2258,7 +2273,6 @@ class DakkarWindow(Gtk.ApplicationWindow):
             self.operations.duplicate(
                 tab.selected_files(),
                 self._non_undoable_done("Duplicate"),
-                self._operation_progress,
             )
 
     def _create_archive(self) -> None:
@@ -2375,6 +2389,98 @@ class DakkarWindow(Gtk.ApplicationWindow):
         except OSError as error:
             self.show_error(status, error)
 
+    @staticmethod
+    def can_find_duplicates(location: Gio.File) -> bool:
+        """
+        Permit duplicate inspection only at native locations outside Trash storage.
+        """
+
+        path = location.get_path()
+        return path is not None and not is_trash_path(Path(path))
+
+    def _find_duplicates(self) -> None:
+        tab = self.active_tab
+        if tab is not None:
+            self._find_duplicates_at(tab.location)
+
+    def _find_duplicates_at(self, location: Gio.File) -> None:
+        if not self.can_find_duplicates(location):
+            return
+        root = Path(location.get_path())
+        for dialog in self._duplicate_dialogs:
+            if dialog.root == root:
+                dialog.present()
+                return
+        dialog = DuplicateDialog(self, root)
+        self._duplicate_dialogs.add(dialog)
+        dialog.present()
+
+    def duplicate_copies_done(self, result: DuplicateTrashResult) -> None:
+        """
+        Record partial completion and refresh affected views across both panes.
+        """
+
+        changed = [
+            Gio.File.new_for_path(str(outcome.copy.candidate.path))
+            for outcome in result.outcomes if outcome.status == "moved"
+        ]
+        if self._closing:
+            return
+        if changed:
+            self.undo_manager.block("Move duplicate copies to Trash")
+            for notebook in self.pane_notebooks:
+                for page in range(notebook.get_n_pages()):
+                    tab = notebook.get_nth_page(page)
+                    if isinstance(tab, BrowserTab):
+                        tab.files_removed(changed)
+        self._update_action_availability()
+
+    @staticmethod
+    def can_restore_empty_files(location: Gio.File) -> bool:
+        """
+        Permit restoration review at native locations outside Trash storage.
+        """
+
+        path = location.get_path()
+        return path is not None and not is_trash_path(Path(path))
+
+    def _restore_empty_files(self) -> None:
+        tab = self.active_tab
+        if tab is not None:
+            self._restore_empty_files_at(tab.location)
+
+    def _restore_empty_files_at(self, location: Gio.File) -> None:
+        if not self.can_restore_empty_files(location):
+            return
+        root = Path(location.get_path())
+        for dialog in self._empty_file_dialogs:
+            if dialog.root == root:
+                dialog.present()
+                return
+        dialog = EmptyFileDialog(self, root)
+        self._empty_file_dialogs.add(dialog)
+        dialog.present()
+
+    def empty_files_restored(self, result: RestoreResult) -> None:
+        """
+        Refresh replaced files across panes and install a barrier after any success.
+        """
+
+        if self._closing:
+            return
+        changed = [
+            Gio.File.new_for_path(str(outcome.request.destination.path))
+            for outcome in result.outcomes if outcome.status == "restored"
+        ]
+        if changed:
+            self.undo_manager.block("Restore empty files")
+            for notebook in self.pane_notebooks:
+                for page in range(notebook.get_n_pages()):
+                    tab = notebook.get_nth_page(page)
+                    if isinstance(tab, BrowserTab):
+                        tab.files_replaced(changed)
+        self._update_action_availability()
+
     def _trash(self) -> None:
         tab = self.active_tab
         if tab is None or not tab.selected_files():
@@ -2382,7 +2488,6 @@ class DakkarWindow(Gtk.ApplicationWindow):
         self.operations.trash(
             tab.selected_files(),
             self._non_undoable_done("Move to Trash"),
-            self._operation_progress,
         )
 
     def _delete(self) -> None:
@@ -2399,7 +2504,6 @@ class DakkarWindow(Gtk.ApplicationWindow):
             lambda: self.operations.delete(
                 files,
                 self._non_undoable_done("Permanent deletion"),
-                self._operation_progress,
             ),
         )
 
@@ -2425,13 +2529,8 @@ class DakkarWindow(Gtk.ApplicationWindow):
             lambda: self.operations.delete(
                 files,
                 self._non_undoable_done("Empty Trash"),
-                self._operation_progress,
             ),
         )
-
-    def _operation_progress(self, label: str, completed: int, total: int) -> None:
-        if self.active_tab is not None:
-            self.active_tab.status_label.set_text(f"{label}: {completed} of {total}")
 
     def _operation_done(
         self,
@@ -2439,7 +2538,10 @@ class DakkarWindow(Gtk.ApplicationWindow):
         changed: list[Gio.File],
         target_tab: BrowserTab | None = None,
     ) -> None:
-        if error is not None:
+        if error is not None and not (
+            isinstance(error, GLib.Error)
+            and error.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED)
+        ):
             self.show_error("File operation failed", error)
         if target_tab is None:
             target_tab = self.active_tab
@@ -2975,6 +3077,11 @@ class DakkarWindow(Gtk.ApplicationWindow):
         dialog.present()
 
     def _close_requested(self, _window) -> bool:
+        self._closing = True
+        for dialog in tuple(self._duplicate_dialogs):
+            dialog.close_review()
+        for dialog in tuple(self._empty_file_dialogs):
+            dialog.close_review()
         self._clear_path_bar()
         for notebook in self.pane_notebooks:
             for page in range(notebook.get_n_pages()):

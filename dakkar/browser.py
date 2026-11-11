@@ -28,6 +28,7 @@ from .expandable import ExpandableDirectoryModel
 from .history import LocationHistory
 from .local_search import IndexedFilenameSearch
 from .models import FileItem, ItemData, query_item_data
+from .operation_panel import OperationPanel
 from .search import FilenameSearch, SearchResult, matches_filters
 from .services import DirectoryLoader, DirectoryMetadataLoader, SelectionSizeLoader
 from .thumbnails import ThumbnailService
@@ -147,6 +148,7 @@ class BrowserTab(Gtk.Box):
         self._search_timeout = 0
         self._search_auto_select_pending = False
         self._searching = False
+        self._removed_search_uris: set[str] = set()
         self._global_search = False
         self.search_mime_group = "all"
         self.search_date_field = "modified"
@@ -241,7 +243,8 @@ class BrowserTab(Gtk.Box):
 
         self.status_label = Gtk.Label(xalign=0.0)
         self.status_label.add_css_class("dakkar-status")
-        self.append(self.status_label)
+        self.operation_panel = OperationPanel(window.operations.monitor, self.status_label)
+        self.append(self.operation_panel)
         self.selection.connect("selection-changed", self._selection_changed)
         self.expandable_selection.connect(
             "selection-changed",
@@ -813,6 +816,22 @@ class BrowserTab(Gtk.Box):
                     target_directory,
                 )
             )
+            if self.window.can_find_duplicates(target_directory):
+                open_section.append_item(
+                    self._targeted_menu_item(
+                        "Find duplicate copies…",
+                        "win.find-duplicates-at",
+                        target_directory,
+                    )
+                )
+            if self.window.can_restore_empty_files(target_directory):
+                open_section.append_item(
+                    self._targeted_menu_item(
+                        "Restore empty files…",
+                        "win.restore-empty-files-at",
+                        target_directory,
+                    )
+                )
         if open_section.get_n_items():
             menu.append_section(None, open_section)
 
@@ -2095,6 +2114,83 @@ class BrowserTab(Gtk.Box):
         if self._pending_monitor_queries:
             self._schedule_monitor_update()
 
+    def files_replaced(self, files: list[Gio.File]) -> None:
+        """
+        Refresh replacements in directory, search and loaded expandable views.
+        """
+
+        for file in files:
+            parent = file.get_parent()
+            if parent is not None:
+                self._recent_directories.pop(parent.get_uri(), None)
+        if not self._searching:
+            self.files_changed(files)
+            self.expandable_model.files_changed(files)
+            return
+        serial = self._search_serial
+        visible = [file for file in files if file.get_uri() in self._result_uris]
+        if not visible:
+            return
+
+        def apply(updates: list[ItemData]) -> bool:
+            if serial != self._search_serial or not self._searching:
+                return GLib.SOURCE_REMOVE
+            selected_uris = {item.uri for item in self.selected_items()}
+            by_uri = {data.uri: data for data in updates}
+            for position in range(self.store.get_n_items() - 1, -1, -1):
+                item = self.store.get_item(position)
+                data = by_uri.get(item.uri)
+                if data is None:
+                    continue
+                if self._matches_current_filters(data):
+                    self.store.splice(position, 1, [FileItem(data, item.relevance)])
+                else:
+                    self.store.remove(position)
+                    self._result_uris.discard(item.uri)
+                    self._removed_search_uris.add(item.uri)
+            self._restore_selected_uris(selected_uris)
+            self._refresh_directory_tints()
+            self._set_base_status(f"{len(self._result_uris)} filename matches")
+            return GLib.SOURCE_REMOVE
+
+        def query() -> None:
+            updates = []
+            for file in visible:
+                try:
+                    updates.append(query_item_data(file))
+                except GLib.Error:
+                    continue
+            GLib.idle_add(apply, updates)
+
+        threading.Thread(target=query, name="dakkar-replacement-update", daemon=True).start()
+
+    def files_removed(self, files: list[Gio.File]) -> None:
+        """
+        Reflect completed removals in directory, search and expanded-branch views.
+        """
+
+        removed_uris = {file.get_uri() for file in files}
+        for file in files:
+            parent = file.get_parent()
+            if parent is not None:
+                self._recent_directories.pop(parent.get_uri(), None)
+            self._remove_directory_data(file.get_uri())
+        self._incoming_directory_data = [
+            data for data in self._incoming_directory_data if data.uri not in removed_uris
+        ]
+        if self._searching:
+            # Suppress stale batches already queued by either search provider.
+            self._removed_search_uris.update(removed_uris)
+            self._result_uris.difference_update(removed_uris)
+            for position in range(self.store.get_n_items() - 1, -1, -1):
+                if self.store.get_item(position).uri in removed_uris:
+                    self.store.remove(position)
+            self._refresh_directory_tints()
+            self._set_base_status(f"{len(self._result_uris)} filename matches")
+        else:
+            self.files_changed(files)
+            self.expandable_model.files_changed(files)
+
     def _flush_monitor_updates(self) -> bool:
         self._monitor_timeout = 0
         generation = self._generation
@@ -2405,6 +2501,7 @@ class BrowserTab(Gtk.Box):
         self._directory_metadata_recursive = False
         self._global_search = global_search
         self._search_serial += 1
+        self._removed_search_uris.clear()
         serial = self._search_serial
         self._search_auto_select_pending = True
         self._result_uris.clear()
@@ -2448,7 +2545,7 @@ class BrowserTab(Gtk.Box):
             return
         items: list[FileItem] = []
         for result in batch:
-            if result.data.uri in self._result_uris:
+            if result.data.uri in self._result_uris or result.data.uri in self._removed_search_uris:
                 continue
             self._result_uris.add(result.data.uri)
             items.append(FileItem(result.data, result.score))
@@ -2594,6 +2691,7 @@ class BrowserTab(Gtk.Box):
         return GLib.SOURCE_REMOVE
 
     def dispose_tab(self) -> None:
+        self.operation_panel.dispose_panel()
         self.cancel()
         self._thumbnails.release_owner(self._thumbnail_owner_id)
         self.expandable_model.dispose()
@@ -2601,3 +2699,11 @@ class BrowserTab(Gtk.Box):
         if self._monitor is not None:
             self._monitor.cancel()
             self._monitor = None
+
+    def toggle_operation_panel(self) -> None:
+        """
+        Show or hide shared operation details beneath this file view.
+        """
+
+        button = self.operation_panel.toggle_button
+        button.set_active(not button.get_active())

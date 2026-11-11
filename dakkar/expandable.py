@@ -306,6 +306,18 @@ class ExpandableDirectoryModel:
         except GLib.Error:
             branch.monitor = None
 
+    def files_changed(self, files: Iterable[Gio.File]) -> None:
+        """
+        Requery operation results at any loaded branch, even without a monitor.
+        """
+
+        for file in files:
+            parent = file.get_parent()
+            if parent is not None:
+                self._branch_changed(
+                    parent.get_uri(), file, None, Gio.FileMonitorEvent.CHANGES_DONE_HINT,
+                )
+
     def _branch_changed(
         self,
         uri: str,
