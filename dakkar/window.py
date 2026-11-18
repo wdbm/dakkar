@@ -1618,7 +1618,8 @@ class DakkarWindow(Gtk.ApplicationWindow):
             "terminal": lambda *_: self._open_terminal(),
             "open": lambda *_: self._open_selected(),
             "open-with": lambda *_: self._open_with(),
-            "run-program": lambda *_: self._run_selected_program(),
+            "run-program-background": lambda *_: self._run_selected_program(in_terminal=False),
+            "run-program-terminal": lambda *_: self._run_selected_program(in_terminal=True),
             "open-tab": lambda *_: self._open_selected_in_tab(),
             "open-pane": lambda *_: self._open_selected_in_pane(),
             "open-window": lambda *_: self._open_selected_in_window(),
@@ -1669,6 +1670,12 @@ class DakkarWindow(Gtk.ApplicationWindow):
         selected_directory = (
             single_item is not None and single_item.is_directory
         )
+        runnable_program = (
+            single_item is not None
+            and not single_item.is_directory
+            and single_item.is_executable
+            and all_local
+        )
         availability = {
             "new-directory": tab is not None,
             "new-file": tab is not None,
@@ -1695,11 +1702,8 @@ class DakkarWindow(Gtk.ApplicationWindow):
             "terminal": tab is not None and tab.location.get_path() is not None,
             "open": selected_directory or all_files,
             "open-with": all_files,
-            "run-program": (
-                single_item is not None
-                and not single_item.is_directory
-                and single_item.is_executable
-            ),
+            "run-program-background": runnable_program,
+            "run-program-terminal": runnable_program,
             "open-tab": selected_directory,
             "open-pane": selected_directory and self.can_open_new_pane(),
             "open-window": selected_directory,
@@ -2774,7 +2778,7 @@ class DakkarWindow(Gtk.ApplicationWindow):
         except OSError as error:
             self.show_error("Unable to open terminal", error)
 
-    def _run_selected_program(self) -> None:
+    def _run_selected_program(self, *, in_terminal: bool) -> None:
         tab = self.active_tab
         if tab is None:
             return
@@ -2786,11 +2790,10 @@ class DakkarWindow(Gtk.ApplicationWindow):
         ):
             return
         item = items[0]
-        self.choose_program_run_mode(
-            item.display_name,
-            lambda: self._run_program_in_background(item.file),
-            lambda timestamp: self._run_program_in_terminal(item.file, timestamp),
-        )
+        if in_terminal:
+            self._run_program_in_terminal(item.file, tab.context_menu_timestamp)
+        else:
+            self._run_program_in_background(item.file)
 
     def _local_program_details(self, file: Gio.File) -> tuple[str, str] | None:
         path = file.get_path()
@@ -3005,61 +3008,6 @@ class DakkarWindow(Gtk.ApplicationWindow):
             target.destroy()
             if response_id == Gtk.ResponseType.OK:
                 callback()
-
-        dialog.connect("response", response)
-        dialog.present()
-
-    def choose_program_run_mode(
-        self,
-        display_name: str,
-        background_callback: Callable[[], None],
-        terminal_callback: Callable[[int], None],
-    ) -> None:
-        background_response = 1
-        terminal_response = 2
-        dialog = Gtk.MessageDialog(
-            transient_for=self,
-            modal=True,
-            message_type=Gtk.MessageType.WARNING,
-            buttons=Gtk.ButtonsType.NONE,
-            text="Run as program?",
-            secondary_text=(
-                f"Choose whether {display_name} is run without a visible terminal "
-                "or in the default terminal."
-            ),
-        )
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        dialog.add_button("Run in background", background_response)
-        terminal_button = dialog.add_button("Run in terminal", terminal_response)
-        dialog.set_default_response(terminal_response)
-        activation = {"timestamp": Gdk.CURRENT_TIME}
-
-        terminal_click = Gtk.GestureClick(button=Gdk.BUTTON_PRIMARY)
-        terminal_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        terminal_click.connect(
-            "pressed",
-            lambda controller, *_arguments: activation.update(
-                timestamp=controller.get_current_event_time()
-            ),
-        )
-        terminal_button.add_controller(terminal_click)
-
-        key_controller = Gtk.EventControllerKey()
-        key_controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        key_controller.connect(
-            "key-pressed",
-            lambda controller, *_arguments: (
-                activation.update(timestamp=controller.get_current_event_time()) or False
-            ),
-        )
-        dialog.add_controller(key_controller)
-
-        def response(target, response_id):
-            target.destroy()
-            if response_id == background_response:
-                background_callback()
-            elif response_id == terminal_response:
-                terminal_callback(activation["timestamp"])
 
         dialog.connect("response", response)
         dialog.present()

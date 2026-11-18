@@ -115,6 +115,7 @@ class BrowserTab(Gtk.Box):
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.window = window
+        self.context_menu_timestamp = Gdk.CURRENT_TIME
         self.location = location
         self.history = LocationHistory()
         self.history.push(location.get_uri())
@@ -704,9 +705,14 @@ class BrowserTab(Gtk.Box):
         popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
         popover.set_size_request(-1, CONTEXT_MENU_MIN_HEIGHT)
         popover.set_parent(view)
+        event_controller = Gtk.EventControllerLegacy()
+        event_controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        event_controller.connect("event", self._context_menu_event)
+        popover.add_controller(event_controller)
         gesture = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
 
         def pressed(_gesture, _count, x, y):
+            self.context_menu_timestamp = _gesture.get_current_event_time()
             selection = self._selection_for_view(view)
             pointed_item = self._item_at_point(view, x, y)
             if pointed_item is None:
@@ -726,6 +732,18 @@ class BrowserTab(Gtk.Box):
         gesture.connect("pressed", pressed)
         view.add_controller(gesture)
         view._dakkar_context_popover = popover
+
+    def _context_menu_event(
+        self,
+        controller: Gtk.EventControllerLegacy,
+        _event: Gdk.Event | None,
+    ) -> bool:
+        # Event wrappers may be unavailable; read the native event time through
+        # the controller to preserve desktop terminal focus handling.
+        timestamp = controller.get_current_event_time()
+        if timestamp != Gdk.CURRENT_TIME:
+            self.context_menu_timestamp = timestamp
+        return False
 
     def _install_middle_click(self, view: Gtk.Widget) -> None:
         gesture = Gtk.GestureClick(button=Gdk.BUTTON_MIDDLE)
@@ -789,8 +807,13 @@ class BrowserTab(Gtk.Box):
                     open_section.append("Open in new pane", "win.open-pane")
                 open_section.append("Open in new window", "win.open-window")
             else:
-                if single_item.is_executable:
-                    open_section.append("Run as program…", "win.run-program")
+                if single_item.is_executable and single_item.file.get_path() is not None:
+                    open_section.append(
+                        "Run as program in background", "win.run-program-background"
+                    )
+                    open_section.append(
+                        "Run as program in terminal", "win.run-program-terminal"
+                    )
             if self._searching:
                 open_section.append("Open item location", "win.open-location")
                 open_section.append(
